@@ -30,159 +30,197 @@ class Taxonomy:
         self.db_path = Path(db_path)
         self._db_: duckdb.DuckDBPyConnection | None = None
 
-    def create_db(self, add_gtdb_taxonomy: bool = False) -> None:
+    def create_db(self, load_ncbi: bool = True, load_gtdb: bool = False) -> None:
         print("Creating taxonomy database")
         # Create a temporary directory to store the downloaded files
         with (
             tempfile.TemporaryDirectory(prefix="taxonomy-") as tmpdirname,
             duckdb.connect(str(self.db_path)) as db,
         ):
-            # Taxonomy files are available under (including a readme file):
-            # https://ftp.ncbi.nih.gov/pub/taxonomy/taxdmp.zip: nodes.dmp and names.dmp
-            # Assembly summary files are available under:
-            # Four master files reporting data for either GenBank or RefSeq genome assemblies
-            # are available under https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/
-            # assembly_summary_genbank.txt            - current GenBank genome assemblies
-            # assembly_summary_genbank_historical.txt - replaced and suppressed GenBank genome
-            #                                           assemblies
-            # assembly_summary_refseq.txt             - current RefSeq genome assemblies
-            # assembly_summary_refseq_historical.txt  - replaced and suppressed RefSeq genome
-            #                                           assemblies
+            # initialize database
+            self._create_tables(db)
+            self._create_indices(db)
 
-            # Download the files
-            taxdmp_zip = str(Path(tmpdirname) / "taxdmp.zip")
-            subprocess.run(
-                ["curl", "-o", taxdmp_zip, "https://ftp.ncbi.nih.gov/pub/taxonomy/taxdmp.zip"],
-                check=True,
-            )
-            subprocess.run(["unzip", "-o", taxdmp_zip], cwd=tmpdirname, check=True)
-
-            # Load the names
-            print("Loading names")
-            names_df = (
-                pl.scan_csv(
-                    f"{tmpdirname}/names.dmp",
-                    separator="|",
-                    has_header=False,
-                    new_columns=["tax_id", "name_txt", "unique_name", "name_class"],
-                    quote_char=None,
+            # Optionally load NCBI taxonomy and assembly summary
+            if load_ncbi:
+                self._load_ncbi_taxonomy(
+                    tmpdirname=tmpdirname,
+                    db=db,
                 )
-                .select(
-                    pl.col("tax_id").cast(pl.Utf8).str.strip_chars("\t"),
-                    pl.col("name_txt").cast(pl.Utf8).str.strip_chars("\t"),
-                    pl.col("name_class").cast(pl.Utf8).str.strip_chars("\t"),
-                )
-                .filter(pl.col("name_class") == "scientific name")
-                .select(
-                    pl.col("tax_id").alias("taxid"), pl.col("name_txt").alias("scientific_name")
-                )
-                .collect()
-            )
-            db.execute("CREATE TABLE names AS SELECT * FROM names_df")
-            db.execute("CREATE INDEX idx_names_taxid ON names (taxid)")
-            print(f"Loaded {len(names_df)} names")
-
-            # Load the nodes
-            print("Loading nodes")
-            nodes_df = (
-                pl.scan_csv(  # noqa: F841
-                    f"{tmpdirname}/nodes.dmp",
-                    separator="|",
-                    has_header=False,
-                    new_columns=[
-                        "tax_id",
-                        "parent_tax_id",
-                        "rank",
-                        "embl_code",
-                        "division_id",
-                        "inherited_div_flag",
-                        "genetic_code_id",
-                        "inherited_GC_flag",
-                        "mitochondrial_genetic_code_id",
-                        "inherited_MGC_flag",
-                        "GenBank_hidden_flag",
-                        "hidden_subtree_root_flag",
-                        "comments",
-                    ],
-                    quote_char=None,
-                )
-                .select(
-                    pl.col("tax_id").cast(pl.Utf8).str.strip_chars("\t").alias("taxid"),
-                    pl.col("parent_tax_id")
-                    .cast(pl.Utf8)
-                    .str.strip_chars("\t")
-                    .alias("parent_taxid"),
-                    pl.col("rank").cast(pl.Utf8).str.strip_chars("\t"),
-                )
-                .collect()
-            )
-            db.execute("CREATE TABLE nodes AS SELECT * FROM nodes_df")
-            db.execute("CREATE INDEX idx_nodes_taxid ON nodes (taxid)")
-            db.execute("CREATE INDEX idx_nodes_parent_taxid ON nodes (parent_taxid)")
-            print(f"Loaded {len(nodes_df)} nodes")
-
-            # Load the assembly summary
-            print("Loading assembly summary")
-
-            def scan_assembly_summary(url: str) -> pl.LazyFrame:
-                filename = url.split("/")[-1]
-                local_path = Path(tmpdirname) / filename
-                subprocess.run(["curl", "-o", local_path, url], check=True)
-                return pl.scan_csv(
-                    local_path,
-                    new_columns=[
-                        "assembly_accession",
-                        "bioproject",
-                        "biosample",
-                        "wgs_master",
-                        "refseq_category",
-                        "taxid",
-                    ],
-                    separator="\t",
-                    has_header=False,
-                    skip_lines=2,
-                    quote_char=None,
-                ).select(
-                    pl.col("assembly_accession"),
-                    pl.col("taxid").cast(pl.Utf8),
-                )
-
-            assemblies_df = pl.concat(  # noqa: F841
-                (
-                    scan_assembly_summary(
-                        "https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/assembly_summary_genbank.txt"
-                    ),
-                    scan_assembly_summary(
-                        "https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/assembly_summary_genbank_historical.txt"
-                    ),
-                    scan_assembly_summary(
-                        "https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/assembly_summary_refseq.txt"
-                    ),
-                    scan_assembly_summary(
-                        "https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/assembly_summary_refseq_historical.txt"
-                    ),
-                ),
-                how="vertical",
-            ).collect()
-            db.execute(
-                "CREATE TABLE assemblies AS SELECT * FROM assemblies_df",
-            )
-            db.execute("CREATE INDEX idx_assemblies_taxid ON assemblies (taxid)")
-            db.execute("CREATE INDEX idx_assemblies_accession ON assemblies (assembly_accession)")
-            print(f"Loaded {len(assemblies_df)} assemblies")
 
             # Optionally load prokaryotic taxonomy from the Genome Taxonomy Database (GTDB)
             # This overwrites the taxonomy for prokaryotes in the assemblies table when they are in GTDB and links them
             # to the GTDB taxonomy.
-            if add_gtdb_taxonomy:
-                self._add_gtdb_taxonomy(db, tmpdirname)
+            if load_gtdb:
+                self._load_gtdb_taxonomy(tmpdirname, db)
 
             print("Done")
 
-    def _add_gtdb_taxonomy(
-        self,
+    @staticmethod
+    def _create_tables(
         db: duckdb.DuckDBPyConnection,
+    ) -> None:
+        # table names
+        db.execute("CREATE TABLE IF NOT EXISTS names (taxid VARCHAR, scientific_name VARCHAR)")
+
+        # table nodes
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS nodes (taxid VARCHAR, parent_taxid VARCHAR, rank VARCHAR)"
+        )
+
+        # table assemblies
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS assemblies (assembly_accession VARCHAR, taxid VARCHAR)"
+        )
+
+    @staticmethod
+    def _create_indices(
+        db: duckdb.DuckDBPyConnection,
+    ) -> None:
+        # table names
+        db.execute("CREATE INDEX idx_names_taxid ON names (taxid)")
+
+        # table nodes
+        db.execute("CREATE INDEX idx_nodes_taxid ON nodes (taxid)")
+        db.execute("CREATE INDEX idx_nodes_parent_taxid ON nodes (parent_taxid)")
+
+        # table assemblies
+        db.execute("CREATE INDEX idx_assemblies_taxid ON assemblies (taxid)")
+        db.execute("CREATE INDEX idx_assemblies_accession ON assemblies (assembly_accession)")
+
+    @staticmethod
+    def _load_ncbi_taxonomy(
         tmpdirname: str,
+        db: duckdb.DuckDBPyConnection,
+    ) -> None:
+        # Taxonomy files are available under (including a readme file):
+        # https://ftp.ncbi.nih.gov/pub/taxonomy/taxdmp.zip: nodes.dmp and names.dmp
+        # Assembly summary files are available under:
+        # Four master files reporting data for either GenBank or RefSeq genome assemblies
+        # are available under https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/
+        # assembly_summary_genbank.txt            - current GenBank genome assemblies
+        # assembly_summary_genbank_historical.txt - replaced and suppressed GenBank genome
+        #                                           assemblies
+        # assembly_summary_refseq.txt             - current RefSeq genome assemblies
+        # assembly_summary_refseq_historical.txt  - replaced and suppressed RefSeq genome
+        #                                           assemblies
+
+        # Download the files
+        taxdmp_zip = str(Path(tmpdirname) / "taxdmp.zip")
+        subprocess.run(
+            ["curl", "-o", taxdmp_zip, "https://ftp.ncbi.nih.gov/pub/taxonomy/taxdmp.zip"],
+            check=True,
+        )
+        subprocess.run(["unzip", "-o", taxdmp_zip], cwd=tmpdirname, check=True)
+
+        # Load the names
+        print("Loading names")
+        names_df = (
+            pl.scan_csv(
+                f"{tmpdirname}/names.dmp",
+                separator="|",
+                has_header=False,
+                new_columns=["tax_id", "name_txt", "unique_name", "name_class"],
+                quote_char=None,
+            )
+            .select(
+                pl.col("tax_id").cast(pl.Utf8).str.strip_chars("\t"),
+                pl.col("name_txt").cast(pl.Utf8).str.strip_chars("\t"),
+                pl.col("name_class").cast(pl.Utf8).str.strip_chars("\t"),
+            )
+            .filter(pl.col("name_class") == "scientific name")
+            .select(pl.col("tax_id").alias("taxid"), pl.col("name_txt").alias("scientific_name"))
+            .collect()
+        )
+        db.execute("INSERT INTO names SELECT * FROM names_df")
+        print(f"Loaded {len(names_df)} names")
+
+        # Load the nodes
+        print("Loading nodes")
+        nodes_df = (
+            pl.scan_csv(  # noqa: F841
+                f"{tmpdirname}/nodes.dmp",
+                separator="|",
+                has_header=False,
+                new_columns=[
+                    "tax_id",
+                    "parent_tax_id",
+                    "rank",
+                    "embl_code",
+                    "division_id",
+                    "inherited_div_flag",
+                    "genetic_code_id",
+                    "inherited_GC_flag",
+                    "mitochondrial_genetic_code_id",
+                    "inherited_MGC_flag",
+                    "GenBank_hidden_flag",
+                    "hidden_subtree_root_flag",
+                    "comments",
+                ],
+                quote_char=None,
+            )
+            .select(
+                pl.col("tax_id").cast(pl.Utf8).str.strip_chars("\t").alias("taxid"),
+                pl.col("parent_tax_id").cast(pl.Utf8).str.strip_chars("\t").alias("parent_taxid"),
+                pl.col("rank").cast(pl.Utf8).str.strip_chars("\t"),
+            )
+            .collect()
+        )
+        db.execute("INSERT INTO nodes SELECT * FROM nodes_df")
+        print(f"Loaded {len(nodes_df)} nodes")
+
+        # Load the assembly summary
+        print("Loading assembly summary")
+
+        def scan_assembly_summary(url: str) -> pl.LazyFrame:
+            filename = url.split("/")[-1]
+            local_path = Path(tmpdirname) / filename
+            subprocess.run(["curl", "-o", local_path, url], check=True)
+            return pl.scan_csv(
+                local_path,
+                new_columns=[
+                    "assembly_accession",
+                    "bioproject",
+                    "biosample",
+                    "wgs_master",
+                    "refseq_category",
+                    "taxid",
+                ],
+                separator="\t",
+                has_header=False,
+                skip_lines=2,
+                quote_char=None,
+            ).select(
+                pl.col("assembly_accession"),
+                pl.col("taxid").cast(pl.Utf8),
+            )
+
+        assemblies_df = pl.concat(  # noqa: F841
+            (
+                scan_assembly_summary(
+                    "https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/assembly_summary_genbank.txt"
+                ),
+                scan_assembly_summary(
+                    "https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/assembly_summary_genbank_historical.txt"
+                ),
+                scan_assembly_summary(
+                    "https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/assembly_summary_refseq.txt"
+                ),
+                scan_assembly_summary(
+                    "https://ftp.ncbi.nlm.nih.gov/genomes/ASSEMBLY_REPORTS/assembly_summary_refseq_historical.txt"
+                ),
+            ),
+            how="vertical",
+        ).collect()
+        db.execute(
+            "INSERT INTO assemblies SELECT * FROM assemblies_df",
+        )
+        print(f"Loaded {len(assemblies_df)} NCBI assemblies")
+
+    def _load_gtdb_taxonomy(
+        self,
+        tmpdirname: str,
+        db: duckdb.DuckDBPyConnection,
         gtdb_release: str = "R10-RS226",
         db_prefix: str = "gtdb",
     ) -> None:
